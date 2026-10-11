@@ -41,7 +41,9 @@ def main() -> int:
     parser.add_argument("--health-url")
     parser.add_argument("--ci-run-url")
     parser.add_argument("--actor")
-    parser.add_argument("--url", default=os.environ.get("RELEASEWATCH_URL", "http://localhost:8000"))
+    parser.add_argument(
+        "--url", default=os.environ.get("RELEASEWATCH_URL", "http://localhost:8000")
+    )
     parser.add_argument(
         "--secret", default=os.environ.get("RELEASEWATCH_WEBHOOK_SECRET", "dev-webhook-secret")
     )
