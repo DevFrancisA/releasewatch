@@ -1,0 +1,37 @@
+# Render Blueprint: web service (API + UI), background worker, and Postgres.
+# Auto-deploy is off on purpose: GitHub Actions triggers the deploy hooks only
+# after pytest, the frontend build, and Playwright pass, then runs smoke checks.
+services:
+  - type: web
+    name: releasewatch
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /readyz
+    autoDeploy: false
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: releasewatch-db
+          property: connectionString
+      - key: RELEASEWATCH_WEBHOOK_SECRET
+        generateValue: true
+      - key: RELEASEWATCH_CORS_ORIGINS
+        value: "[]"
+
+  - type: worker
+    name: releasewatch-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerCommand: /entrypoint.sh worker
+    autoDeploy: false
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: releasewatch-db
+          property: connectionString
+
+databases:
+  - name: releasewatch-db
+    databaseName: releasewatch
+    user: releasewatch
+    postgresMajorVersion: "16"

@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:5173"]
     # Directory containing the built React app; served at / when present.
     static_dir: str | None = None
+    # Commit being served, reported by /healthz so deploy smoke checks can confirm
+    # the new build is live. Render sets RENDER_GIT_COMMIT automatically.
+    git_sha: str | None = Field(
+        default=None, validation_alias=AliasChoices("RELEASEWATCH_GIT_SHA", "RENDER_GIT_COMMIT")
+    )
 
     @field_validator("database_url")
     @classmethod

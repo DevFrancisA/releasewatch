@@ -31,9 +31,9 @@ def create_app() -> FastAPI:
         app.include_router(module.router)
 
     @app.get("/healthz", tags=["ops"])
-    def healthz() -> dict[str, str]:
-        """Liveness: the process is up."""
-        return {"status": "ok", "version": __version__}
+    def healthz() -> dict[str, str | None]:
+        """Liveness: the process is up, and which build it is running."""
+        return {"status": "ok", "version": __version__, "commit": settings.git_sha}
 
     @app.get("/readyz", tags=["ops"])
     def readyz(session: Session = Depends(get_session)) -> dict[str, str]:
