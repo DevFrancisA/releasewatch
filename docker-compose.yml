@@ -1,0 +1,50 @@
+name: releasewatch
+
+x-app: &app
+  build: .
+  environment:
+    DATABASE_URL: postgresql+psycopg://releasewatch:releasewatch@db:5432/releasewatch
+    RELEASEWATCH_WEBHOOK_SECRET: ${RELEASEWATCH_WEBHOOK_SECRET:-dev-webhook-secret}
+    RELEASEWATCH_HEALTH_CHECK_INITIAL_DELAY_SECONDS: ${RELEASEWATCH_HEALTH_CHECK_INITIAL_DELAY_SECONDS:-5}
+    RELEASEWATCH_HEALTH_CHECK_INTERVAL_SECONDS: ${RELEASEWATCH_HEALTH_CHECK_INTERVAL_SECONDS:-10}
+  depends_on:
+    db:
+      condition: service_healthy
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: releasewatch
+      POSTGRES_PASSWORD: releasewatch
+      POSTGRES_DB: releasewatch
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U releasewatch"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  api:
+    <<: *app
+    command: ["api"]
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    <<: *app
+    command: ["worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
