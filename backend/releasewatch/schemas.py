@@ -141,16 +141,12 @@ class ReleaseDetail(ReleaseOut):
 
 class ReleasePage(BaseModel):
     items: list[ReleaseOut]
-    page: int
-    page_size: int
-    total: int
+    next_cursor: str | None = Field(description="Pass as ?cursor= to fetch the next page")
 
 
 class EventPage(BaseModel):
     items: list[EventOut]
-    page: int
-    page_size: int
-    total: int
+    next_cursor: str | None = Field(description="Pass as ?cursor= to fetch the next page")
 
 
 class ServiceStats(BaseModel):

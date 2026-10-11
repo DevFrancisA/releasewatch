@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from releasewatch.db import get_session
 from releasewatch.models import Event, Service
+from releasewatch.pagination import paginate, split_page
 from releasewatch.schemas import EventOut, EventPage
 
 router = APIRouter(prefix="/api/events", tags=["events"])
@@ -14,27 +15,24 @@ def list_events(
     service: str | None = None,
     release_id: int | None = None,
     event_type: str | None = None,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
     session: Session = Depends(get_session),
 ) -> EventPage:
     query = select(Event)
     if service:
-        query = query.join(Service, Service.id == Event.service_id).where(Service.name == service)
+        service_id = session.scalar(select(Service.id).where(Service.name == service))
+        if service_id is None:
+            return EventPage(items=[], next_cursor=None)
+        query = query.where(Event.service_id == service_id)
     if release_id is not None:
         query = query.where(Event.release_id == release_id)
     if event_type:
         query = query.where(Event.event_type == event_type)
 
-    total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
-    events = session.scalars(
-        query.order_by(Event.received_at.desc(), Event.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).all()
+    rows = session.scalars(paginate(query, Event.received_at, Event.id, cursor, limit)).all()
+    events, next_cursor = split_page(list(rows), limit, lambda e: (e.received_at, e.id))
     return EventPage(
         items=[EventOut.model_validate(e) for e in events],
-        page=page,
-        page_size=page_size,
-        total=total,
+        next_cursor=next_cursor,
     )

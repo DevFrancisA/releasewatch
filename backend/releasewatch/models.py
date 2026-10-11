@@ -9,11 +9,13 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -60,7 +62,15 @@ class Service(Base):
 
 class Release(Base):
     __tablename__ = "releases"
-    __table_args__ = (UniqueConstraint("service_id", "external_id", name="uq_releases_external"),)
+    # Lists are ordered by (created_at DESC, id DESC); Postgres scans these btrees
+    # backwards for that, so each filter + sort combination is a single range scan.
+    __table_args__ = (
+        UniqueConstraint("service_id", "external_id", name="uq_releases_external"),
+        Index("ix_releases_created", "created_at", "id"),
+        Index("ix_releases_service_created", "service_id", "created_at", "id"),
+        Index("ix_releases_service_env_created", "service_id", "environment", "created_at", "id"),
+        Index("ix_releases_status_created", "status", "created_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     service_id: Mapped[int] = mapped_column(ForeignKey("services.id", ondelete="CASCADE"))
@@ -108,6 +118,11 @@ class Event(Base):
     """
 
     __tablename__ = "events"
+    __table_args__ = (
+        Index("ix_events_release_received", "release_id", "received_at", "id"),
+        Index("ix_events_service_received", "service_id", "received_at", "id"),
+        Index("ix_events_received", "received_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     service_id: Mapped[int] = mapped_column(ForeignKey("services.id", ondelete="CASCADE"))
@@ -145,6 +160,10 @@ class Job(Base):
     """Postgres-backed work queue consumed by the worker with SKIP LOCKED."""
 
     __tablename__ = "jobs"
+    __table_args__ = (
+        # The worker's claim query only ever looks at due, queued jobs.
+        Index("ix_jobs_queued_run_at", "run_at", "id", postgresql_where=text("status = 'queued'")),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     kind: Mapped[str] = mapped_column(String(50))

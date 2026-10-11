@@ -1,15 +1,53 @@
-from sqlalchemy import func, select
+from collections.abc import Sequence
+
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
-from releasewatch.models import CheckOutcome, Event, Release
+from releasewatch.models import CheckOutcome, Event, HealthCheck, Release
 from releasewatch.schemas import HealthSummary, ReleaseOut
 
 
+def releases_out(session: Session, releases: Sequence[Release]) -> list[ReleaseOut]:
+    """Serialize a page of releases with two aggregate queries instead of N+1 lookups.
+
+    Callers must load `Release.service` eagerly (joinedload) so that reading the
+    service name does not trigger a query per row.
+    """
+    ids = [r.id for r in releases]
+    if not ids:
+        return []
+
+    health = {
+        row.release_id: (row.passed, row.failed)
+        for row in session.execute(
+            select(
+                HealthCheck.release_id,
+                func.count(case((HealthCheck.outcome == CheckOutcome.PASSED, 1))).label("passed"),
+                func.count(case((HealthCheck.outcome == CheckOutcome.FAILED, 1))).label("failed"),
+            )
+            .where(HealthCheck.release_id.in_(ids))
+            .group_by(HealthCheck.release_id)
+        )
+    }
+    event_counts = {
+        release_id: count
+        for release_id, count in session.execute(
+            select(Event.release_id, func.count())
+            .where(Event.release_id.in_(ids))
+            .group_by(Event.release_id)
+        )
+    }
+    return [
+        to_out(release, health.get(release.id, (0, 0)), event_counts.get(release.id, 0))
+        for release in releases
+    ]
+
+
 def release_out(session: Session, release: Release) -> ReleaseOut:
-    checks = release.health_checks
-    event_count = session.scalar(
-        select(func.count()).select_from(Event).where(Event.release_id == release.id)
-    )
+    return releases_out(session, [release])[0]
+
+
+def to_out(release: Release, health: tuple[int, int], event_count: int) -> ReleaseOut:
     return ReleaseOut(
         id=release.id,
         service=release.service.name,
@@ -27,10 +65,6 @@ def release_out(session: Session, release: Release) -> ReleaseOut:
         rollback_reason=release.rollback_reason,
         rollback_requested_at=release.rollback_requested_at,
         rollback_completed_at=release.rollback_completed_at,
-        health=HealthSummary(
-            passed=sum(1 for c in checks if c.outcome == CheckOutcome.PASSED),
-            failed=sum(1 for c in checks if c.outcome == CheckOutcome.FAILED),
-            required=release.checks_required,
-        ),
-        event_count=event_count or 0,
+        health=HealthSummary(passed=health[0], failed=health[1], required=release.checks_required),
+        event_count=event_count,
     )

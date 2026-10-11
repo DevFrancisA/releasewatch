@@ -1,7 +1,10 @@
+from contextlib import contextmanager
 from datetime import timedelta
 
+from sqlalchemy import event as sa_event
 from sqlalchemy import update
 
+from releasewatch.db import get_engine
 from releasewatch.lifecycle import utcnow
 from releasewatch.models import Release
 from tests.conftest import deploy_payload
@@ -131,20 +134,78 @@ def test_list_releases_paginates_without_gaps_or_duplicates(client, send_webhook
     session.execute(update(Release).where(Release.id <= 10).values(created_at=utcnow()))
     session.commit()
 
-    seen = _collect_pages(client, "/api/releases", page_size=5)
+    seen = _collect_pages(client, "/api/releases", limit=5)
     assert len(seen) == 23
     assert len(set(seen)) == 23
+    # Rows 1-10 were bumped to "now", so they lead (id DESC breaks the tie).
+    assert seen == [*range(10, 0, -1), *range(23, 10, -1)]
 
 
-def _collect_pages(client, path: str, page_size: int) -> list[int]:
+def test_cursor_pages_stay_stable_while_new_releases_arrive(client, send_webhook):
+    for i in range(6):
+        send_webhook(deploy_payload(version=f"v{i}", deployment_id=f"d{i}", health_url=None))
+
+    first = client.get("/api/releases", params={"limit": 3}).json()
+    # New deployments land between page loads; OFFSET paging would repeat rows here.
+    for i in range(6, 9):
+        send_webhook(deploy_payload(version=f"v{i}", deployment_id=f"d{i}", health_url=None))
+    second = client.get("/api/releases", params={"limit": 3, "cursor": first["next_cursor"]}).json()
+
+    assert [r["version"] for r in first["items"]] == ["v5", "v4", "v3"]
+    assert [r["version"] for r in second["items"]] == ["v2", "v1", "v0"]
+    assert second["next_cursor"] is None
+
+
+def test_invalid_cursor_is_rejected(client):
+    assert client.get("/api/releases", params={"cursor": "not-a-cursor"}).status_code == 400
+    assert client.get("/api/events", params={"cursor": "e30"}).status_code == 400
+
+
+def test_release_list_query_count_does_not_grow_with_page_size(client, send_webhook):
+    for i in range(30):
+        send_webhook(deploy_payload(version=f"v{i}", deployment_id=f"d{i}"))
+
+    with count_queries() as small:
+        client.get("/api/releases", params={"limit": 2})
+    with count_queries() as large:
+        client.get("/api/releases", params={"limit": 30})
+
+    assert len(large) == len(small) <= 3
+
+
+@contextmanager
+def count_queries():
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    engine = get_engine()
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+
+
+def _collect_pages(client, path: str, limit: int) -> list[int]:
     seen: list[int] = []
-    page = 1
+    cursor = None
     while True:
-        body = client.get(path, params={"page_size": page_size, "page": page}).json()
+        params = {"limit": limit} | ({"cursor": cursor} if cursor else {})
+        body = client.get(path, params=params).json()
         seen.extend(item["id"] for item in body["items"])
-        if len(body["items"]) < page_size:
+        cursor = body["next_cursor"]
+        if cursor is None:
             return seen
-        page += 1
+
+
+def test_list_events_pages_through_service_history(client, send_webhook):
+    for i in range(4):
+        send_webhook(deploy_payload(version=f"v{i}", deployment_id=f"d{i}"))
+    ids = _collect_pages(client, "/api/events?service=checkout", limit=3)
+    assert len(ids) == 8  # deployment.succeeded + verification.started per release
+    assert ids == sorted(ids, reverse=True)
 
 
 def test_list_events_filters(client, send_webhook):

@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from releasewatch.db import get_session
@@ -32,29 +32,44 @@ def summary(
 ) -> Summary:
     since = utcnow() - timedelta(days=window_days)
 
-    services_stats: list[ServiceStats] = []
-    by_status: dict[str, int] = {s.value: 0 for s in ReleaseStatus}
-    for service in session.scalars(select(Service).order_by(Service.name)):
-        query = select(Release).where(Release.service_id == service.id, Release.created_at >= since)
-        if environment:
-            query = query.where(Release.environment == environment)
-        releases = session.scalars(query).all()
-        for release in releases:
-            by_status[release.status] += 1
+    # One grouped scan for per-service, per-status counts inside the window.
+    counts_query = (
+        select(Release.service_id, Release.status, func.count())
+        .where(Release.created_at >= since)
+        .group_by(Release.service_id, Release.status)
+    )
+    # One DISTINCT ON query for each service's most recent release.
+    latest_query = (
+        select(Release.service_id, Release.status, Release.version, Release.created_at)
+        .distinct(Release.service_id)
+        .order_by(Release.service_id, Release.created_at.desc(), Release.id.desc())
+    )
+    if environment:
+        counts_query = counts_query.where(Release.environment == environment)
+        latest_query = latest_query.where(Release.environment == environment)
 
-        last = session.scalar(
-            select(Release)
-            .where(Release.service_id == service.id)
-            .order_by(Release.created_at.desc(), Release.id.desc())
-            .limit(1)
-        )
-        failed = sum(1 for r in releases if r.status in FAILURE_STATUSES)
+    by_status: dict[str, int] = {s.value: 0 for s in ReleaseStatus}
+    per_service: dict[int, list[int]] = {}
+    for service_id, status, count in session.execute(counts_query):
+        by_status[status] += count
+        totals = per_service.setdefault(service_id, [0, 0])
+        totals[0] += count
+        if status in FAILURE_STATUSES:
+            totals[1] += count
+
+    latest = {row.service_id: row for row in session.execute(latest_query)}
+
+    services_stats = []
+    services = session.execute(select(Service.id, Service.name).order_by(Service.name))
+    for service_id, name in services:
+        total, failed = per_service.get(service_id, (0, 0))
+        last = latest.get(service_id)
         services_stats.append(
             ServiceStats(
-                service=service.name,
-                releases=len(releases),
+                service=name,
+                releases=total,
                 failed=failed,
-                change_failure_rate=_rate(failed, len(releases)),
+                change_failure_rate=_rate(failed, total),
                 last_release_status=last.status if last else None,
                 last_release_version=last.version if last else None,
                 last_release_at=last.created_at if last else None,

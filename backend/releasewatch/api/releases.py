@@ -1,12 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from releasewatch import lifecycle
-from releasewatch.api.serializers import release_out
+from releasewatch.api.serializers import release_out, releases_out, to_out
 from releasewatch.db import get_session
 from releasewatch.lifecycle import NewRelease, TransitionError
-from releasewatch.models import Release, ReleaseStatus, Service
+from releasewatch.models import CheckOutcome, Release, ReleaseStatus, Service
+from releasewatch.pagination import paginate, split_page
 from releasewatch.schemas import (
     EventOut,
     HealthCheckOut,
@@ -25,30 +26,24 @@ def list_releases(
     service: str | None = None,
     environment: str | None = None,
     status_: ReleaseStatus | None = Query(default=None, alias="status"),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=25, ge=1, le=100),
+    cursor: str | None = None,
+    limit: int = Query(default=25, ge=1, le=100),
     session: Session = Depends(get_session),
 ) -> ReleasePage:
-    query = select(Release)
+    query = select(Release).options(joinedload(Release.service))
     if service:
-        query = query.join(Service).where(Service.name == service)
+        service_id = session.scalar(select(Service.id).where(Service.name == service))
+        if service_id is None:
+            return ReleasePage(items=[], next_cursor=None)
+        query = query.where(Release.service_id == service_id)
     if environment:
         query = query.where(Release.environment == environment)
     if status_:
         query = query.where(Release.status == status_)
 
-    total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
-    releases = session.scalars(
-        query.order_by(Release.created_at.desc(), Release.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).all()
-    return ReleasePage(
-        items=[release_out(session, r) for r in releases],
-        page=page,
-        page_size=page_size,
-        total=total,
-    )
+    rows = session.scalars(paginate(query, Release.created_at, Release.id, cursor, limit)).all()
+    releases, next_cursor = split_page(list(rows), limit, lambda r: (r.created_at, r.id))
+    return ReleasePage(items=releases_out(session, releases), next_cursor=next_cursor)
 
 
 @router.post("", response_model=ReleaseOut, status_code=status.HTTP_201_CREATED)
@@ -77,14 +72,32 @@ def _get_release(session: Session, release_id: int, *, lock: bool = False) -> Re
 
 @router.get("/{release_id}", response_model=ReleaseDetail)
 def get_release(release_id: int, session: Session = Depends(get_session)) -> ReleaseDetail:
-    release = _get_release(session, release_id)
-    base = release_out(session, release)
+    release = session.scalar(
+        select(Release)
+        .where(Release.id == release_id)
+        .options(
+            joinedload(Release.service),
+            joinedload(Release.rollback_target),
+            selectinload(Release.health_checks),
+            selectinload(Release.events),
+        )
+    )
+    if release is None:
+        raise HTTPException(status_code=404, detail="release not found")
+    checks = release.health_checks
     return ReleaseDetail(
-        **base.model_dump(),
+        **to_out(
+            release,
+            health=(
+                sum(c.outcome == CheckOutcome.PASSED for c in checks),
+                sum(c.outcome == CheckOutcome.FAILED for c in checks),
+            ),
+            event_count=len(release.events),
+        ).model_dump(),
         rollback_target_version=release.rollback_target.version
         if release.rollback_target
         else None,
-        health_checks=[HealthCheckOut.model_validate(c) for c in release.health_checks],
+        health_checks=[HealthCheckOut.model_validate(c) for c in checks],
         events=[EventOut.model_validate(e) for e in release.events],
     )
 
